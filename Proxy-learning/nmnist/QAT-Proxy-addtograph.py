@@ -45,6 +45,31 @@ class StochasticRounding(torch.autograd.Function):
         return grad_input
 
 
+def _quantization_scale(input_tensor, bit_precision=8):
+    """
+    :param input_tensor: the input tensor that need to be quantized
+    :param precision: quantization precision
+    :return: The quantized tensor
+    """
+
+    min_val_disc = -(2 ** (bit_precision - 1))
+    max_val_disc = 2 ** (bit_precision - 1) - 1
+
+    # Range in which values lie
+    min_val_obj = torch.min(input_tensor)
+    max_val_obj = torch.max(input_tensor)
+
+    # Determine if negative or positive values are to be considered for scaling
+    # Take into account that range for diescrete negative values is slightly larger than for positive
+    min_max_ratio_disc = abs(min_val_disc / max_val_disc)
+    if abs(min_val_obj) <= abs(max_val_obj) * min_max_ratio_disc:
+        scaling = abs(max_val_disc / max_val_obj)
+    else:
+        scaling = abs(min_val_disc / min_val_obj)
+
+    return scaling
+
+
 class ANN(torch.nn.Module):
 
     def __init__(self):
@@ -61,7 +86,6 @@ class ANN(torch.nn.Module):
         self.round = StochasticRounding
 
     def forward(self, sample):
-
         q1 = _quantization_scale(self.conv1.weight.data)
         propgate = self.relu(self.round.apply(self.conv1(sample) * q1) / q1)
         q2 = _quantization_scale(self.conv2.weight.data)
@@ -122,8 +146,6 @@ class SNN(torch.nn.Module):
                 lyrs.v_mem.detach_()
 
 
-
-
 ann_seq = nn.Sequential(
     nn.Conv2d(1, 16, kernel_size=(5, 5), stride=(2, 2), padding=(1, 1), bias=False),  # 16, 18, 18
     nn.ReLU(),
@@ -144,137 +166,13 @@ ann_seq = nn.Sequential(
 )
 
 
-def _quantization_scale(input_tensor, bit_precision=8):
-    """
-    :param input_tensor: the input tensor that need to be quantized
-    :param precision: quantization precision
-    :return: The quantized tensor
-    """
-
-    min_val_disc = -(2 ** (bit_precision - 1))
-    max_val_disc = 2 ** (bit_precision - 1) - 1
-
-    # Range in which values lie
-    min_val_obj = torch.min(input_tensor)
-    max_val_obj = torch.max(input_tensor)
-
-    # Determine if negative or positive values are to be considered for scaling
-    # Take into account that range for diescrete negative values is slightly larger than for positive
-    min_max_ratio_disc = abs(min_val_disc / max_val_disc)
-    if abs(min_val_obj) <= abs(max_val_obj) * min_max_ratio_disc:
-        scaling = abs(max_val_disc / max_val_obj)
-    else:
-        scaling = abs(min_val_disc / min_val_obj)
-
-    return scaling
-
-
-class ANN_SNN_PROXY_MODULE(torch.nn.Module):
-    def __init__(self, batch_size, device):
-
-        super().__init__()
-        self.batch_size = batch_size
-        self.device = device
-
-        # model define
-        self.ann = nn.Sequential(
-            nn.Conv2d(1, 16, kernel_size=(5, 5), stride=(2, 2), padding=(1, 1), bias=False),  # 16, 18, 18
-            nn.ReLU(),
-
-            nn.Conv2d(16, 16, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False),  # 8, 18,18
-            nn.ReLU(),
-            nn.AvgPool2d(kernel_size=(2, 2)),  # 8, 17,17
-
-            nn.Conv2d(16, 8, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False),  # 8, 9, 9
-            nn.ReLU(),
-            nn.AvgPool2d(kernel_size=(2, 2)),
-
-            nn.Flatten(),
-            nn.Linear(4 * 4 * 8, 256, bias=False),
-            nn.ReLU(),
-
-            nn.Linear(256, 10, bias=False),
-        )
-        # weight initialization
-        self.weight_initializer(self.ann)
-        # create identical IAF SNN
-        self.snn = from_model(self.ann, batch_size=self.batch_size, surrogate_grad_fn=PeriodicExponential(),
-                              reset_fn=MembraneSubtract(), spike_threshold=1, min_v_mem=-1).spiking_model
-        self.ann[0].register_forward_hook(self.quantization_hook_fn)
-
-        self.ann = self.ann.to(self.device)
-        self.snn = self.ann.to(self.device)
-
-    def forward(self, sample):
-        # forwards ann and snn together
-        return self.ann_forward(sample), self.snn_forward(sample)
-
-    def final_relu_spiking(self):
-        # add leaky relu at the end of ann
-        # add IAFsqueeze at the end of snn
-
-        self.ann = nn.Sequential(*self.ann, nn.LeakyReLU())
-        self.snn = nn.Sequential(*self.snn,
-                                 IAFSqueeze(batch_size=self.batch_size, surrogate_grad_fn=PeriodicExponential(),
-                                            reset_fn=MembraneSubtract(), spike_threshold=1, min_v_mem=-1))
-
-    @staticmethod
-    def quantization_hook_fn(module, input, output):
-        print("1")
-        output *= 100
-        # output.round_()
-
-    def ann_forward(self, sample):
-        # data reshape to (B,C,H,W)
-        sample = sample.clone().sum(1).sum(1).unsqueeze(1)
-        sample = sample.to(self.device)
-        return self.ann(sample)
-
-    def snn_forward(self, sample):
-        # data reshape to (B,T,C,H,W)
-        sample = sample.clone().sum(2).unsqueeze(2)
-        sample = sample.to(self.device)
-        (batch_size, t_len, channel, height, width) = sample.shape
-        sample = sample.reshape((batch_size * t_len, channel, height, width))
-        out = self.snn(sample)
-        out = out.reshape(batch_size, t_len, 10)
-        out = out.sum(1)
-        return out
-
-    @staticmethod
-    def weight_initializer(model):
-        for layer in model:
-            if isinstance(layer, nn.Conv2d) or isinstance(layer, nn.Linear):
-                torch.nn.init.xavier_uniform_(layer.weight)
-
-    @staticmethod
-    def weight_clipping(model: nn.Sequential, min=-1, max=1):
-
-        for lyrs in model:
-            if isinstance(lyrs, nn.Conv2d) or isinstance(lyrs, nn.Linear):
-                lyrs.weight.data.clamp_(min=min, max=max)
-
-    @staticmethod
-    def _weight_sharing_(source: nn.Sequential, target):
-        """
-        source and target should have identical structure and only have conv and linear layers
-        :param source: source model that parameter copy from
-        :param target: target model that parameter
-        :return:
-        """
-        for lyrs in source.state_dict():
-            if not "v_mem" in lyrs:
-                layer_number = int(lyrs.split(".")[0])
-                target[layer_number].weight.data.copy_(source[layer_number].weight.data)
-            # target[layer_number].weight.data=source[layer_number].weight.data
-
-
 def weight_transfer(module: nn.Module, seq: nn.Sequential):
     seq[0].weight.data = torch.round(module.conv1.weight.data.clone() * _quantization_scale(module.conv1.weight.data))
     seq[2].weight.data = torch.round(module.conv2.weight.data.clone() * _quantization_scale(module.conv2.weight.data))
     seq[5].weight.data = torch.round(module.conv3.weight.data.clone() * _quantization_scale(module.conv3.weight.data))
     seq[9].weight.data = torch.round(module.fc1.weight.data.clone() * _quantization_scale(module.fc1.weight.data))
     seq[11].weight.data = torch.round(module.fc2.weight.data.clone() * _quantization_scale(module.fc2.weight.data))
+
 
 
 train_raster = SpikeTrainDataset(dt=1000, source_folder="./train_set_time50", target_transform=int,
