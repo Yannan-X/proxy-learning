@@ -166,13 +166,19 @@ ann_seq = nn.Sequential(
 )
 
 
-def weight_transfer(module: nn.Module, seq: nn.Sequential):
-    seq[0].weight.data = torch.round(module.conv1.weight.data.clone() * _quantization_scale(module.conv1.weight.data))
-    seq[2].weight.data = torch.round(module.conv2.weight.data.clone() * _quantization_scale(module.conv2.weight.data))
-    seq[5].weight.data = torch.round(module.conv3.weight.data.clone() * _quantization_scale(module.conv3.weight.data))
-    seq[9].weight.data = torch.round(module.fc1.weight.data.clone() * _quantization_scale(module.fc1.weight.data))
-    seq[11].weight.data = torch.round(module.fc2.weight.data.clone() * _quantization_scale(module.fc2.weight.data))
+def weight_transfer(module: nn.Module, seq: nn.Module):
 
+    # seq[0].weight.data = torch.round(module.conv1.weight.data.clone() * _quantization_scale(module.conv1.weight.data))
+    # seq[2].weight.data = torch.round(module.conv2.weight.data.clone() * _quantization_scale(module.conv2.weight.data))
+    # seq[5].weight.data = torch.round(module.conv3.weight.data.clone() * _quantization_scale(module.conv3.weight.data))
+    # seq[9].weight.data = torch.round(module.fc1.weight.data.clone() * _quantization_scale(module.fc1.weight.data))
+    # seq[11].weight.data = torch.round(module.fc2.weight.data.clone() * _quantization_scale(module.fc2.weight.data))
+
+    seq[0].weight.data = module.conv1.weight.data.clone()
+    seq[2].weight.data = module.conv2.weight.data.clone()
+    seq[5].weight.data = module.conv3.weight.data.clone()
+    seq[9].weight.data = module.fc1.weight.data.clone()
+    seq[11].weight.data = module.fc2.weight.data.clone()
 
 def discrete_snn(model, w_precision=8, state_precision=16, low_thresh=-1, spike_thresh=1):
     """
@@ -233,10 +239,17 @@ for m in ann.children():
 snn = SNN(batchsize=batchsize)
 snn_q = SNN(batchsize=batchsize)
 
+weight_transfer(ann, snn.snn)
+weight_transfer(ann, snn_q.snn)
+
+
+
 optimizer = torch.optim.Adam(ann.parameters(), lr=1e-3)
 criterion = nn.CrossEntropyLoss()
 for _ in range(100):
-    model.train()
+    ann.train()
+    snn.train()
+
     num_samples = 0
     correct_ann = 0
     pbr = tqdm(train_loader)
