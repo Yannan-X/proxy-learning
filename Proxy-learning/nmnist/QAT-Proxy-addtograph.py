@@ -174,6 +174,38 @@ def weight_transfer(module: nn.Module, seq: nn.Sequential):
     seq[11].weight.data = torch.round(module.fc2.weight.data.clone() * _quantization_scale(module.fc2.weight.data))
 
 
+def discrete_snn(model, w_precision=8, state_precision=16, low_thresh=-1, spike_thresh=1):
+    """
+    Does the identical quantization method with DYNAPCNN-COMPATIBLE network discrete method
+    :param spike_thresh: spiking threshold
+    :param low_thresh: low v_mem boundard of the layer
+    :param model: sequential snn model, suppose to have IAFsqueeze layers followed by parameter layers
+    :param w_precision: predefined by chip
+    :param state_precision:  predefined by chip
+    :return:
+    """
+
+    depth = len(model)
+
+    for i, lyrs in enumerate(model):
+        if i <= depth - 2:
+            if isinstance(lyrs, nn.Conv2d) or isinstance(lyrs, nn.Linear):
+                # print(f"current_layer numner: {i}")
+                w_factor = _quantization_scale(lyrs.weight.data, bit_precision=w_precision)
+                thresholds = torch.tensor((low_thresh, spike_thresh)).to(device)
+                t_factor = _quantization_scale(thresholds, bit_precision=state_precision)
+                scale = min(w_factor, t_factor)
+
+                lyrs.weight.data = torch.round(lyrs.weight.data.clone() * scale).to(device)
+                (model[i + 1].min_v_mem, model[i + 1].spike_threshold) = torch.round(thresholds.clone() * scale)
+                model[i + 1].v_mem.data = torch.round(model[i + 1].v_mem.data.clone() * scale)
+
+            else:
+                if isinstance(lyrs, nn.Conv2d) or isinstance(lyrs, nn.Linear):
+                    # print(f"current_layer numner: {i}")
+                    w_factor = _quantization_scale(lyrs.weight.data, bit_precision=w_precision)
+                    lyrs.weight.data = torch.round(lyrs.weight.data.clone() * w_factor).to(device)
+
 
 train_raster = SpikeTrainDataset(dt=1000, source_folder="./train_set_time50", target_transform=int,
                                  force_n_time_bins=50)
@@ -186,19 +218,23 @@ test_loader = DataLoader(test_raster, batch_size=batchsize, shuffle=True, drop_l
 
 # model = ANN_SNN_PROXY_MODULE(batch_size=batchsize, device=torch.device("cuda"))
 device = torch.device("cuda")
-model = ANN()
-model.to(device)
+ann = ANN()
+ann.to(device)
 ann_seq = ann_seq.to(device)
 # for _ in range(1000):
 #     out = model.ann_forward(torch.ones((500, 1, 1, 34, 34)))
 #     print(out.sum().sum())
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-criterion = nn.CrossEntropyLoss()
 
-for m in model.children():
+
+for m in ann.children():
     if isinstance(m, (nn.Conv2d, nn.Linear)):
         torch.nn.init.xavier_uniform_(m.weight)
 
+snn = SNN(batchsize=batchsize)
+snn_q = SNN(batchsize=batchsize)
+
+optimizer = torch.optim.Adam(ann.parameters(), lr=1e-3)
+criterion = nn.CrossEntropyLoss()
 for _ in range(100):
     model.train()
     num_samples = 0
