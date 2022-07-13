@@ -104,9 +104,9 @@ class ANN(torch.nn.Module):
 
 class SNN(torch.nn.Module):
 
-    def __init__(self, batchsize):
+    def __init__(self, batchsize, device):
         super(SNN, self).__init__()
-
+        self.device = device
         self.snn = nn.Sequential(
             nn.Conv2d(1, 16, kernel_size=(5, 5), stride=(2, 2), padding=(1, 1), bias=False),  # 16, 18, 18
             IAFSqueeze(batch_size=batchsize, surrogate_grad_fn=PeriodicExponential(),
@@ -167,7 +167,6 @@ ann_seq = nn.Sequential(
 
 
 def weight_transfer(module: nn.Module, seq: nn.Module):
-
     # seq[0].weight.data = torch.round(module.conv1.weight.data.clone() * _quantization_scale(module.conv1.weight.data))
     # seq[2].weight.data = torch.round(module.conv2.weight.data.clone() * _quantization_scale(module.conv2.weight.data))
     # seq[5].weight.data = torch.round(module.conv3.weight.data.clone() * _quantization_scale(module.conv3.weight.data))
@@ -179,6 +178,7 @@ def weight_transfer(module: nn.Module, seq: nn.Module):
     seq[5].weight.data = module.conv3.weight.data.clone()
     seq[9].weight.data = module.fc1.weight.data.clone()
     seq[11].weight.data = module.fc2.weight.data.clone()
+
 
 def discrete_snn(model, w_precision=8, state_precision=16, low_thresh=-1, spike_thresh=1):
     """
@@ -225,7 +225,7 @@ test_loader = DataLoader(test_raster, batch_size=batchsize, shuffle=True, drop_l
 # model = ANN_SNN_PROXY_MODULE(batch_size=batchsize, device=torch.device("cuda"))
 device = torch.device("cuda")
 ann = ANN()
-ann.to(device)
+
 ann_seq = ann_seq.to(device)
 # for _ in range(1000):
 #     out = model.ann_forward(torch.ones((500, 1, 1, 34, 34)))
@@ -236,62 +236,96 @@ for m in ann.children():
     if isinstance(m, (nn.Conv2d, nn.Linear)):
         torch.nn.init.xavier_uniform_(m.weight)
 
-snn = SNN(batchsize=batchsize)
-snn_q = SNN(batchsize=batchsize)
+snn = SNN(batchsize=batchsize, device=device)
+snn_q = SNN(batchsize=batchsize, device=device)
+
+ann.to(device)
+snn.to(device)
+snn_q.to(device)
 
 weight_transfer(ann, snn.snn)
 weight_transfer(ann, snn_q.snn)
+discrete_snn(snn_q.snn)
 
+optimizer = torch.optim.Adam(ann.parameters(), lr=1e-3, weight_decay=1e-8)
 
-
-optimizer = torch.optim.Adam(ann.parameters(), lr=1e-3)
 criterion = nn.CrossEntropyLoss()
+
 for _ in range(100):
     ann.train()
     snn.train()
 
     num_samples = 0
     correct_ann = 0
+    correct_snn = 0
     pbr = tqdm(train_loader)
+
     for sample, target in pbr:
-        sample = sample.clone().sum(1).sum(1).unsqueeze(1)
+        # prepare samples
+
         sample = sample.to(device)
+        sample_ann = sample.clone().sum(1).sum(1).unsqueeze(1)
+        sample_snn = sample.clone().sum(2).unsqueeze(2)
         target = target.to(device)
-        out = model(sample)
-        loss = criterion(out, target)
+
+        out_ann = ann(sample_ann)
+        with torch.no_grad():
+            out_snn = snn(sample_snn)
+
+        _, ann_predict = torch.max(out_ann, 1)
+        _, snn_predict = torch.max(out_snn, 1)
+
+        correct_ann += (ann_predict == target).sum().item()
+        correct_snn += (snn_predict == target).sum().item()
+        num_samples += batchsize
+
+        out_ann.data.copy_(out_snn)
+
+        loss = criterion(out_ann, target)
+
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-        _, ann_predict = torch.max(out, 1)
-        correct_ann += (ann_predict == target).sum().item()
-        num_samples += batchsize
+        weight_transfer(ann, snn.snn)
 
-        pbr.set_description(f"acc:{round(correct_ann / num_samples, 4)}")
+        pbr.set_description(
+            f"train_ann:{round(correct_ann / num_samples, 4)}, train_snn:{round(correct_snn / num_samples, 4)}")
 
-    model.eval()
-    ann_seq.eval()
-    weight_transfer(model, ann_seq)
+
+    ann.eval()
+    snn.eval()
+    snn_q.eval()
+
+    weight_transfer(ann, snn_q.snn)
+    discrete_snn(snn_q.snn)
+
     num_samples = 0
     correct_ann = 0
-    correct_Q = 0
+    correct_snn = 0
+    correct_snn_q = 0
     pbr = tqdm(test_loader)
 
     with torch.no_grad():
         for sample, target in pbr:
-            sample = sample.clone().sum(1).sum(1).unsqueeze(1)
             sample = sample.to(device)
+            sample_snn = sample.clone().sum(2).unsqueeze(2)
+            sample_ann = sample.clone().sum(1).sum(1).unsqueeze(1)
             target = target.to(device)
-            out = model(sample)
-            out_Q = ann_seq(sample)
 
-            _, ann_predict = torch.max(out, 1)
-            _, q_predict = torch.max(out_Q, 1)
+            out_ann = ann(sample_ann)
+            out_snn = snn(sample_snn)
+            out_snnq = snn_q(sample_snn)
+
+            _, ann_predict = torch.max(out_ann, 1)
+            _, snn_predict = torch.max(out_snn, 1)
+            _, snnq_predict = torch.max(out_snnq, 1)
 
             correct_ann += (ann_predict == target).sum().item()
-            correct_Q += (q_predict == target).sum().item()
+            correct_snn += (snn_predict == target).sum().item()
+            correct_snn_q += (snnq_predict == target).sum().item()
 
             num_samples += batchsize
 
             pbr.set_description(
-                f"acc:{round(correct_ann / num_samples, 4)}||| Qacc:{round(correct_Q / num_samples, 4)}")
+                f"T_ann:{round(correct_ann / num_samples, 4)}||| T_snn:{round(correct_snn / num_samples, 4)}, T_q:{round(correct_snn_q / num_samples, 4)}")
