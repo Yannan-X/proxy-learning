@@ -20,7 +20,7 @@ import time
 
 localtime = time.asctime(time.localtime(time.time()))
 tensorboard_dir = f"./tensorboardRC/{localtime}/"
-save_file_name = "simulator-proxy"
+save_file_name = "simulator-proxy-WC"
 writer = SummaryWriter(f"{tensorboard_dir}{save_file_name}")
 
 number_of_epochs = 50
@@ -80,9 +80,9 @@ class ProxyAnnSnn(nn.Module):
         for lyrs in self.ann:
             if isinstance(lyrs, (nn.Conv2d, nn.Linear)):
                 lyr_counter += 1
-                if lyr_counter in [2,3]:
+                if lyr_counter in [2, 3]:
                     # downsampling weight to adpat pooling layer
-                    ann_weight = lyrs.weight.clone()/4
+                    ann_weight = lyrs.weight.clone() / 4
                 else:
                     ann_weight = lyrs.weight.clone()
                 scale, thresh = self.obtain_scale_factor_of_a_layer(weight=ann_weight)
@@ -144,19 +144,12 @@ class ProxyAnnSnn(nn.Module):
 
     @staticmethod
     def _collect_output_events_from_simulator(
-        output_event_stream: List[Event2d], number_of_class: int
+            output_event_stream: List[Event2d], number_of_class: int
     ) -> Tensor:
         counts = torch.zeros(number_of_class)
         for item in output_event_stream:
             counts[int(str(item).split("\t")[0].split(":")[-1])] += 1
         return counts
-
-    @staticmethod
-    def weight_clipping(models: nn.Sequential, mins=-1, maxs=1):
-        # clipping the weight to be symmetric
-        for lyrs in models:
-            if isinstance(lyrs, nn.Conv2d) or isinstance(lyrs, nn.Linear):
-                lyrs.weight.data.clamp_(min=mins, max=maxs)
 
     @staticmethod
     def _get_quantization_scale(input_tensor, bit_precision=8):
@@ -184,13 +177,13 @@ class ProxyAnnSnn(nn.Module):
         return scaling
 
     def obtain_scale_factor_of_a_layer(
-        self,
-        weight,
-        spike_thresh=1,
-        low_thresh=-1,
-        w_precision=8,
-        state_precision=16,
-        device=torch.device("cpu"),
+            self,
+            weight,
+            spike_thresh=1,
+            low_thresh=-1,
+            w_precision=8,
+            state_precision=16,
+            device=torch.device("cpu"),
     ) -> [float, Tuple[int, int]]:
 
         w_factor = self._get_quantization_scale(weight.data, bit_precision=w_precision)
@@ -210,9 +203,17 @@ def get_number_of_correct_samples(network_output: Tensor, label: int) -> int:
     return correct
 
 
+def weight_clipping(models: nn.Sequential, mins=-1, maxs=1):
+    # clipping the weight to be symmetric
+    for lyrs in models:
+        if isinstance(lyrs, nn.Conv2d) or isinstance(lyrs, nn.Linear):
+            lyrs.weight.data.clamp_(min=mins, max=maxs)
+
+
 # model initialization and optimizer define
 model = ProxyAnnSnn()
-optimizer = torch.optim.Adam(model.ann.parameters(), lr=1e-3)
+# optimizer = torch.optim.Adam(model.ann.parameters(), lr=1e-3)
+optimizer = torch.optim.SGD(model.ann.parameters(), lr=1e-3)
 criterion = nn.CrossEntropyLoss()
 
 # Generating the random reading sequence for frame and xytp datasets
@@ -256,7 +257,7 @@ for epochs in range(number_of_epochs):
 
         target_output = 50
         sim_out_count = out_simulator.sum()
-        out_loss = (1 / sim_out_count**2) * np.sqrt(
+        out_loss = (1 / sim_out_count ** 2) * np.sqrt(
             (sim_out_count - target_output) ** 2
         )
         loss = criterion(out_ann, frame_target)
@@ -282,6 +283,9 @@ for epochs in range(number_of_epochs):
                     global_step=step,
                 )
         optimizer.step()
+
+        #
+        weight_clipping(model.ann)
 
         writer.add_scalar(
             "train/acc_ann", round(correct_ann / number_of_samples, 4), global_step=step
