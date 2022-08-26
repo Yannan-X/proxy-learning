@@ -132,6 +132,7 @@ class ProxyAnnSnn(nn.Module):
 
         ann_activation = sum(self.ann_activation_record)
         snn_activation = sum(output_list_eachlayer)
+
         self.ann_activation_record = []
         
         return ann_output, snn_output, ann_activation, snn_activation
@@ -222,7 +223,7 @@ def weight_clipping(models: nn.Sequential, mins=-1, maxs=1):
 # model initialization and optimizer define
 model = ProxyAnnSnn()
 # optimizer = torch.optim.Adam(model.ann.parameters(), lr=1e-3)
-optimizer = torch.optim.SGD(model.ann.parameters(), lr=1e-3)
+optimizer = torch.optim.SGD(model.ann.parameters(), lr=1e-4)
 criterion = nn.CrossEntropyLoss()
 
 # Generating the random reading sequence for frame and xytp datasets
@@ -267,8 +268,9 @@ for epochs in range(number_of_epochs):
         out_ann.data.copy_(out_simulator)
         ann_activation.copy_(torch.tensor(snn_activation))
         
-        target_activation = 1e7
-        proxy_activation_loss = 1/torch.sqrt((target_activation - ann_activation)**2)
+        target_activation = 2e4
+        proxy_activation_loss = 10 * (1 / ann_activation ** 2) * torch.sqrt((ann_activation - target_activation) ** 2)
+
         if target_activation > ann_activation:
             loss = criterion(out_ann, frame_target)
         else:
@@ -311,26 +313,27 @@ for epochs in range(number_of_epochs):
             global_step=step,
         )
 
-        writer.add_scalar("train/out_loss", out_loss, global_step=step)
+        writer.add_scalar("train/loss", loss.item(), global_step=step)
+        writer.add_scalar("train/activation_loss", proxy_activation_loss, global_step=step)
         # writer.add_scalar("train/input_count", len(xytp_sample), global_step=step)
 
-        # for layer_index, ls in enumerate(model.ann):
-        #     if isinstance(ls, (nn.Conv2d, nn.Linear)):
-        #         writer.add_scalar(
-        #             f"lyr{layer_index}/weight_max",
-        #             ls.weight.data.max(),
-        #             global_step=step,
-        #         )
-        #         writer.add_scalar(
-        #             f"lyr{layer_index}/weight_min",
-        #             ls.weight.data.min(),
-        #             global_step=step,
-        #         )
-        #         writer.add_scalar(
-        #             f"lyr{layer_index}/weight_average",
-        #             ls.weight.data.mean(),
-        #             global_step=step,
-        #         )
+        for layer_index, ls in enumerate(model.ann):
+            if isinstance(ls, (nn.Conv2d, nn.Linear)):
+                writer.add_scalar(
+                    f"lyr{layer_index}/weight_max",
+                    ls.weight.data.max(),
+                    global_step=step,
+                )
+                writer.add_scalar(
+                    f"lyr{layer_index}/weight_min",
+                    ls.weight.data.min(),
+                    global_step=step,
+                )
+                writer.add_scalar(
+                    f"lyr{layer_index}/weight_average",
+                    ls.weight.data.mean(),
+                    global_step=step,
+                )
 
         pbr.set_description(
             f"train_ann:{round(correct_ann / number_of_samples, 4)}, "
