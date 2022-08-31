@@ -40,11 +40,8 @@ correct_simulator = 0
 number_of_samples = 0
 
 count = 0
-multi_process_reading_index = []
-for index in range(len(reading_sequence) // 2):
-    multi_process_reading_index.append(
-        [reading_sequence[index], reading_sequence[index + 1]]
-    )
+
+multi_process_reading_index = Multi_process_batching.generate_batch_based_reading_sequence(reading_sequences=reading_sequence, batch=2)
 
 optimizer = torch.optim.SGD(model.ann.parameters(), lr=1e-4)
 criterion = nn.CrossEntropyLoss()
